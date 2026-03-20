@@ -1117,38 +1117,30 @@ class HunyuanVideo_1_5_Pipeline(DiffusionPipeline):
                     device=device,
                     dtype=timesteps.dtype,
                 )
-                # compute kv cache
-                with (
-                    torch.autocast(
+
+                self.scheduler.set_timesteps(self.num_inference_steps, device=device)
+
+            start_idx = chunk_i * self.chunk_latent_frames
+            end_idx = chunk_i * self.chunk_latent_frames + self.chunk_latent_frames
+
+            #   load→recache→offload→load→denoise→offload  （previous）
+            #   load→recache→denoise→offload               （current）
+            with (
+                self.progress_bar(total=self.num_inference_steps) as progress_bar,
+                auto_offload_model(
+                    self.transformer,
+                    self.execution_device,
+                    enabled=self.enable_offloading,
+                ),
+            ):
+                # ── recache（仅 chunk_i > 0）──────────────────────────────────────
+                if chunk_i > 0:
+                    with torch.autocast(
                         device_type="cuda",
                         dtype=self.target_dtype,
                         enabled=self.autocast_enabled,
-                    ),
-                    auto_offload_model(
-                        self.transformer,
-                        self.execution_device,
-                        enabled=self.enable_offloading,
-                    ),
-                ):
-                    self._kv_cache = self.transformer(
-                        bi_inference=False,
-                        ar_txt_inference=False,
-                        ar_vision_inference=True,
-                        hidden_states=context_latents_input,
-                        timestep=context_timestep,
-                        timestep_r=None,
-                        mask_type=task_type,
-                        return_dict=False,
-                        viewmats=context_viewmats.to(self.target_dtype),
-                        Ks=context_Ks.to(self.target_dtype),
-                        action=context_action.to(self.target_dtype),
-                        kv_cache=self._kv_cache,
-                        cache_vision=True,
-                        rope_temporal_size=context_latents_input.shape[2],
-                        start_rope_start_idx=0,
-                    )
-                    if self.do_classifier_free_guidance:
-                        self._kv_cache_neg = self.transformer(
+                    ):
+                        self._kv_cache = self.transformer(
                             bi_inference=False,
                             ar_txt_inference=False,
                             ar_vision_inference=True,
@@ -1160,25 +1152,31 @@ class HunyuanVideo_1_5_Pipeline(DiffusionPipeline):
                             viewmats=context_viewmats.to(self.target_dtype),
                             Ks=context_Ks.to(self.target_dtype),
                             action=context_action.to(self.target_dtype),
-                            kv_cache=self._kv_cache_neg,
+                            kv_cache=self._kv_cache,
                             cache_vision=True,
                             rope_temporal_size=context_latents_input.shape[2],
                             start_rope_start_idx=0,
                         )
+                        if self.do_classifier_free_guidance:
+                            self._kv_cache_neg = self.transformer(
+                                bi_inference=False,
+                                ar_txt_inference=False,
+                                ar_vision_inference=True,
+                                hidden_states=context_latents_input,
+                                timestep=context_timestep,
+                                timestep_r=None,
+                                mask_type=task_type,
+                                return_dict=False,
+                                viewmats=context_viewmats.to(self.target_dtype),
+                                Ks=context_Ks.to(self.target_dtype),
+                                action=context_action.to(self.target_dtype),
+                                kv_cache=self._kv_cache_neg,
+                                cache_vision=True,
+                                rope_temporal_size=context_latents_input.shape[2],
+                                start_rope_start_idx=0,
+                            )
 
-                self.scheduler.set_timesteps(self.num_inference_steps, device=device)
-
-            start_idx = chunk_i * self.chunk_latent_frames
-            end_idx = chunk_i * self.chunk_latent_frames + self.chunk_latent_frames
-
-            with (
-                self.progress_bar(total=self.num_inference_steps) as progress_bar,
-                auto_offload_model(
-                    self.transformer,
-                    self.execution_device,
-                    enabled=self.enable_offloading,
-                ),
-            ):
+                # ── denoise loop ──────────────────────────────────────────────────
                 for i, t in enumerate(timesteps):
                     timestep_input = torch.full(
                         (self.chunk_latent_frames,),
@@ -1259,6 +1257,7 @@ class HunyuanVideo_1_5_Pipeline(DiffusionPipeline):
                     ):
                         if progress_bar is not None:
                             progress_bar.update()
+
         return latents
 
     def bi_rollout(
