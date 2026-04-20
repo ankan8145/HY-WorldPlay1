@@ -165,7 +165,6 @@ logs/
 .cache/
 cache/
 ckpts/
-Checkpoint/
 
 
 hyvideo/utils/rewrite/i2v_env.sh

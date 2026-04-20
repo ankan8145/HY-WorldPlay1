@@ -102,43 +102,19 @@ def maybe_load_fsdp_model(
     # with set_default_dtype(param_dtype), torch.device("meta"):
     with set_default_dtype(param_dtype):
         logger.info(f"loading from: {load_from_dir}")
-        logger.info("model: %s", model_cls)
-        main_ckpt_path = os.path.join(load_from_dir,
-                                      "diffusion_pytorch_model.safetensors")
-        action_weights_in_main_checkpoint = False
+        logger.info(f"model:", model_cls)
+        # model = model_cls(**init_params)
+        model = model_cls.from_pretrained(
+            load_from_dir, local_attn_size=-1, sink_size=0)
 
-        if "Action" in cls_name and os.path.exists(main_ckpt_path):
-            from safetensors import safe_open
-
-            with safe_open(main_ckpt_path, framework="pt",
-                           device="cpu") as f:
-                checkpoint_keys = list(f.keys())
-            action_weights_in_main_checkpoint = any(
-                key.startswith("action_in.") or
-                "img_attn_prope_proj" in key for key in checkpoint_keys)
-
-        if "Action" in cls_name and action_weights_in_main_checkpoint:
-            config = model_cls.load_config(load_from_dir)
-            model = model_cls.from_config(config)
-        else:
-            # model = model_cls(**init_params)
-            model = model_cls.from_pretrained(
-                load_from_dir, local_attn_size=-1, sink_size=0)
-
+        
         if "Action" in cls_name:
-            from safetensors.torch import load_file
-
             model.add_discrete_action_parameters()
-
-            if action_weights_in_main_checkpoint:
-                state_dict = load_file(main_ckpt_path)
-                model.load_state_dict(state_dict, strict=True)
-                logger.info("loading action-aware checkpoint from: %s",
-                            main_ckpt_path)
-            elif ar_action_load_from_dir is not None:
+            if ar_action_load_from_dir is not None:
+                from safetensors.torch import load_file
                 state_dict = load_file(ar_action_load_from_dir)
                 model.load_state_dict(state_dict, strict=True)
-                logger.info(f"loading from: {ar_action_load_from_dir}")
+            logger.info(f"loading from: {ar_action_load_from_dir}")
             # model.add_channel_concat_parameters()
 
         model.to(torch.float32)

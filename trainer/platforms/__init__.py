@@ -17,7 +17,6 @@ def cuda_platform_plugin() -> str | None:
     is_cuda = False
 
     try:
-        import torch
         from trainer.utils import import_pynvml
         pynvml = import_pynvml()  # type: ignore[no-untyped-call]
         pynvml.nvmlInit()
@@ -44,9 +43,6 @@ def cuda_platform_plugin() -> str | None:
 
         if cuda_is_jetson():
             is_cuda = True
-        elif getattr(torch.version, "hip", None) is None and torch.cuda.is_available():
-            # Fallback for environments where NVML is unavailable but CUDA is visible.
-            is_cuda = True
     if is_cuda:
         logger.info("CUDA is available")
 
@@ -58,9 +54,8 @@ def mps_platform_plugin() -> str | None:
     is_mps = False
 
     try:
-        import sys
         import torch
-        if sys.platform == "darwin" and torch.backends.mps.is_available():
+        if torch.backends.mps.is_available():
             is_mps = True
             logger.info("MPS (Metal Performance Shaders) is available")
     except Exception as e:
@@ -79,7 +74,6 @@ def rocm_platform_plugin() -> str | None:
     is_rocm = False
 
     try:
-        import torch
         import amdsmi
         amdsmi.amdsmi_init()
         try:
@@ -90,13 +84,6 @@ def rocm_platform_plugin() -> str | None:
             amdsmi.amdsmi_shut_down()
     except Exception as e:
         logger.info("ROCm platform is unavailable: %s", e)
-        try:
-            import torch
-            if getattr(torch.version, "hip", None) is not None and torch.cuda.is_available():
-                is_rocm = True
-                logger.info("ROCm platform is available via torch HIP fallback")
-        except Exception as torch_e:
-            logger.info("ROCm torch HIP fallback failed: %s", torch_e)
 
     return "trainer.platforms.rocm.RocmPlatform" if is_rocm else None
 

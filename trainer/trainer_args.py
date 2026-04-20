@@ -686,9 +686,6 @@ class TrainingArgs(TrainerArgs):
 
     # camera dataset
     json_path: str = ""
-    dataset_type: str = "camera_action_mem"
-    origami_reference_mode: str = "latest_past_or_global"
-    origami_history_keep: int = 3
     causal: bool = False
     window_frames: int = 9
     wandb_key: str = "f8f8f614d325bd04540f8517b142ca942b21017a"
@@ -707,7 +704,6 @@ class TrainingArgs(TrainerArgs):
     fake_score_lr_scheduler: str = "constant"  # separate lr scheduler for fake_score_transformer, if not set, use lr_scheduler
     training_state_checkpointing_steps: int = 0  # for resuming training
     weight_only_checkpointing_steps: int = 0  # for inference
-    log_steps: int = 10
     log_visualization: bool = False
     # simulate generator forward to match inference
     simulate_generator_forward: bool = False
@@ -880,10 +876,6 @@ class TrainingArgs(TrainerArgs):
             "--weight-only-checkpointing-steps",
             type=int,
             help="Steps between weight-only checkpoints (for inference)")
-        parser.add_argument("--log-steps",
-                            type=int,
-                            default=TrainingArgs.log_steps,
-                            help="Steps between detailed training log lines")
         parser.add_argument("--resume-from-checkpoint",
                             type=str,
                             help="Path to checkpoint to resume from")
@@ -1066,18 +1058,6 @@ class TrainingArgs(TrainerArgs):
                             type=str,
                             default="/all_data.json",
                             help="camera json path")
-        parser.add_argument("--dataset-type",
-                            type=str,
-                            default=TrainingArgs.dataset_type,
-                            help="dataset type for AR training")
-        parser.add_argument("--origami-reference-mode",
-                            type=str,
-                            default=TrainingArgs.origami_reference_mode,
-                            help="reference image selection mode for origami dataset")
-        parser.add_argument("--origami-history-keep",
-                            type=int,
-                            default=TrainingArgs.origami_history_keep,
-                            help="number of history captions to preserve in origami manifests")
         parser.add_argument("--causal",
                             action=StoreBoolean,
                             help="training ar model")
