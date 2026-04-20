@@ -114,13 +114,39 @@ def get_sigmas(noise_scheduler,
         sigma = sigma.unsqueeze(-1)
     return sigma
 
-def remove_previous_state(output_dir, rank):
-    checkpoint_dir_list = os.listdir(output_dir)
-    for checkpoint_dir in checkpoint_dir_list:
-        save_dir = os.path.join(output_dir, checkpoint_dir)
-        dcp_dir = os.path.join(save_dir, "distributed_checkpoint")
-        if os.path.exists(dcp_dir) and rank == 0:
-            shutil.rmtree(dcp_dir)
+def _list_checkpoint_dirs(output_dir: str) -> list[tuple[int, str]]:
+    checkpoint_dirs: list[tuple[int, str]] = []
+    if not os.path.exists(output_dir):
+        return checkpoint_dirs
+
+    for entry in os.listdir(output_dir):
+        if not entry.startswith("checkpoint-"):
+            continue
+        step_str = entry.split("checkpoint-")[-1]
+        try:
+            step = int(step_str)
+        except ValueError:
+            continue
+        checkpoint_dirs.append((step, os.path.join(output_dir, entry)))
+
+    checkpoint_dirs.sort(key=lambda item: item[0])
+    return checkpoint_dirs
+
+
+def prune_old_checkpoints(output_dir: str, rank: int, save_limit: int) -> None:
+    if rank != 0 or save_limit <= 0:
+        return
+
+    checkpoint_dirs = _list_checkpoint_dirs(output_dir)
+    if len(checkpoint_dirs) <= save_limit:
+        return
+
+    stale_checkpoints = checkpoint_dirs[:-save_limit]
+    for stale_step, stale_dir in stale_checkpoints:
+        logger.info("Removing old checkpoint checkpoint-%s at %s",
+                    stale_step,
+                    stale_dir)
+        shutil.rmtree(stale_dir, ignore_errors=True)
 
 def save_checkpoint(transformer,
                     rank,
@@ -129,75 +155,93 @@ def save_checkpoint(transformer,
                     optimizer=None,
                     dataloader=None,
                     scheduler=None,
-                    noise_generator=None) -> None:
+                    noise_generator=None,
+                    save_distributed_checkpoint: bool = True,
+                    save_consolidated_checkpoint: bool = True,
+                    checkpoints_total_limit: int = 0) -> None:
     """
     Save checkpoint following finetrainer's distributed checkpoint approach.
     Saves both distributed checkpoint and consolidated model weights.
     """
-    if os.path.exists(output_dir):
-        remove_previous_state(output_dir, rank)
     save_dir = os.path.join(output_dir, f"checkpoint-{step}")
     os.makedirs(save_dir, exist_ok=True)
 
-    states = {
-        "model": ModelWrapper(transformer),
-        "random_state": RandomStateWrapper(noise_generator),
-    }
+    if save_distributed_checkpoint:
+        states = {
+            "model": ModelWrapper(transformer),
+            "random_state": RandomStateWrapper(noise_generator),
+        }
 
-    if optimizer is not None:
-        states["optimizer"] = OptimizerWrapper(transformer, optimizer)
+        if optimizer is not None:
+            states["optimizer"] = OptimizerWrapper(transformer, optimizer)
 
-    if dataloader is not None:
-        states["dataloader"] = dataloader
+        if dataloader is not None:
+            states["dataloader"] = dataloader
 
-    if scheduler is not None:
-        states["scheduler"] = SchedulerWrapper(scheduler)
-    dcp_dir = os.path.join(save_dir, "distributed_checkpoint")
-    logger.info("rank: %s, saving distributed checkpoint to %s",
-                rank,
-                dcp_dir,
-                local_main_process_only=False)
-
-    begin_time = time.perf_counter()
-    dcp.save(states, checkpoint_id=dcp_dir)
-    end_time = time.perf_counter()
-
-    logger.info("rank: %s, distributed checkpoint saved in %.2f seconds",
-                rank,
-                end_time - begin_time,
-                local_main_process_only=False)
-
-    cpu_state = gather_state_dict_on_cpu_rank0(transformer, device=None)
-    if rank == 0:
-        # Save model weights (consolidated)
-        transformer_save_dir = os.path.join(save_dir, "transformer")
-        os.makedirs(transformer_save_dir, exist_ok=True)
-        weight_path = os.path.join(transformer_save_dir,
-                                   "diffusion_pytorch_model.safetensors")
-        logger.info("rank: %s, saving consolidated checkpoint to %s",
+        if scheduler is not None:
+            states["scheduler"] = SchedulerWrapper(scheduler)
+        dcp_dir = os.path.join(save_dir, "distributed_checkpoint")
+        logger.info("rank: %s, saving distributed checkpoint to %s",
                     rank,
-                    weight_path,
+                    dcp_dir,
                     local_main_process_only=False)
 
-        # Convert training format to diffusers format and save
-        # diffusers_state_dict = custom_to_hf_state_dict(
-        #     cpu_state, transformer.reverse_param_names_mapping)
-        save_file(cpu_state, weight_path)
+        begin_time = time.perf_counter()
+        dcp.save(states, checkpoint_id=dcp_dir)
+        end_time = time.perf_counter()
 
-        logger.info("rank: %s, consolidated checkpoint saved to %s",
+        logger.info("rank: %s, distributed checkpoint saved in %.2f seconds",
                     rank,
-                    weight_path,
+                    end_time - begin_time,
                     local_main_process_only=False)
 
-        # Save model config
-        config_dict = transformer.config
-        if "dtype" in config_dict:
-            del config_dict["dtype"]  # TODO
-        config_path = os.path.join(transformer_save_dir, "config.json")
-        # save dict as json
-        with open(config_path, "w") as f:
-            json.dump(config_dict, f, indent=4)
-        logger.info("--> checkpoint saved at step %s to %s", step, weight_path)
+        # Keep ranks aligned before entering the consolidated full-parameter gather.
+        # Without this, faster ranks can start DTensor full_tensor() collectives
+        # while slower ranks are still inside the distributed checkpoint save path.
+        if dist.is_initialized():
+            dist.barrier()
+
+    if save_consolidated_checkpoint:
+        cpu_state = gather_state_dict_on_cpu_rank0(transformer, device=None)
+        if rank == 0:
+            # Save model weights (consolidated)
+            transformer_save_dir = os.path.join(save_dir, "transformer")
+            os.makedirs(transformer_save_dir, exist_ok=True)
+            weight_path = os.path.join(transformer_save_dir,
+                                       "diffusion_pytorch_model.safetensors")
+            logger.info("rank: %s, saving consolidated checkpoint to %s",
+                        rank,
+                        weight_path,
+                        local_main_process_only=False)
+
+            # Convert training format to diffusers format and save
+            # diffusers_state_dict = custom_to_hf_state_dict(
+            #     cpu_state, transformer.reverse_param_names_mapping)
+            save_file(cpu_state, weight_path)
+
+            logger.info("rank: %s, consolidated checkpoint saved to %s",
+                        rank,
+                        weight_path,
+                        local_main_process_only=False)
+
+            # Save model config
+            config_dict = transformer.config
+            if "dtype" in config_dict:
+                del config_dict["dtype"]  # TODO
+            config_path = os.path.join(transformer_save_dir, "config.json")
+            # save dict as json
+            with open(config_path, "w") as f:
+                json.dump(config_dict, f, indent=4)
+            logger.info("--> checkpoint saved at step %s to %s", step, weight_path)
+
+        # Keep non-zero ranks from racing back into training while rank 0 is still
+        # finalizing the consolidated checkpoint files.
+        if dist.is_initialized():
+            dist.barrier()
+
+    prune_old_checkpoints(output_dir, rank, checkpoints_total_limit)
+    if dist.is_initialized():
+        dist.barrier()
 
 def load_checkpoint(transformer,
                     rank,

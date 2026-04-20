@@ -50,6 +50,61 @@ from trainer.platforms import current_platform
 logger = init_logger(__name__)
 
 
+def _visible_accelerator_env() -> dict[str, str]:
+    return {
+        name: value
+        for name in (
+            "CUDA_VISIBLE_DEVICES",
+            "HIP_VISIBLE_DEVICES",
+            "ROCR_VISIBLE_DEVICES",
+        )
+        if (value := os.environ.get(name))
+    }
+
+
+def _env_exposes_single_device_per_process(visible_env: dict[str, str]) -> bool:
+    if not visible_env:
+        return False
+    return all(
+        len([entry for entry in value.split(",") if entry.strip()]) == 1
+        for value in visible_env.values()
+    )
+
+
+def _resolve_local_accelerator_index(local_rank: int | None = None) -> int:
+    if not current_platform.is_cuda_alike():
+        raise RuntimeError(
+            "Local accelerator index requested on a non-accelerator platform."
+        )
+
+    local_rank = envs.LOCAL_RANK if local_rank is None else local_rank
+    device_count = torch.cuda.device_count()
+    if device_count <= 0:
+        raise RuntimeError(
+            "No visible accelerators were detected for this process. "
+            f"LOCAL_RANK={local_rank}, visible_env={_visible_accelerator_env()}"
+        )
+
+    if 0 <= local_rank < device_count:
+        return local_rank
+
+    visible_env = _visible_accelerator_env()
+    if device_count == 1 and _env_exposes_single_device_per_process(visible_env):
+        logger.warning(
+            "LOCAL_RANK=%d but this process can see only one accelerator; "
+            "falling back to cuda:0. This is expected when the runtime "
+            "remaps each worker to a single visible GPU. visible_env=%s",
+            local_rank,
+            visible_env,
+        )
+        return 0
+
+    raise ValueError(
+        f"LOCAL_RANK={local_rank} is out of range for {device_count} visible "
+        f"accelerators. visible_env={visible_env}"
+    )
+
+
 @dataclass
 class GraphCaptureContext:
     stream: torch.cuda.Stream | None
@@ -791,21 +846,26 @@ def init_distributed_environment(
             "distributed_init_method must be provided when initializing "
             "distributed environment")
 
-        # For MPS, don't pass device_id as it doesn't support device indices
-        if current_platform.is_mps():
+        # Only accelerator backends should receive a device_id.
+        # CPU/gloo and MPS init must omit it.
+        if not current_platform.is_cuda_alike():
             torch.distributed.init_process_group(
                 backend=backend,
                 init_method=distributed_init_method,
                 world_size=world_size,
                 rank=rank)
         else:
-            # this backend is used for WORLD
+            resolved_device = device_id or torch.device(
+                f"cuda:{_resolve_local_accelerator_index(local_rank)}"
+            )
+            torch.cuda.set_device(resolved_device)
+            # RCCL/NCCL initialization does not require device_id here, and
+            # omitting it avoids local-rank/device visibility mismatches.
             torch.distributed.init_process_group(
                 backend=backend,
                 init_method=distributed_init_method,
                 world_size=world_size,
-                rank=rank,
-                device_id=device_id)
+                rank=rank)
     # set the local rank
     # local_rank is not available in torch ProcessGroup,
     # see https://github.com/pytorch/pytorch/issues/122816
@@ -948,9 +1008,9 @@ def get_dp_rank() -> int:
 
 def get_local_torch_device() -> torch.device:
     """Return the torch device for the current rank."""
-    return torch.device(f"cuda:{envs.LOCAL_RANK}"
-                        ) if current_platform.is_cuda_alike() else torch.device(
-                            "mps")
+    if not current_platform.is_cuda_alike():
+        return torch.device("mps") if current_platform.is_mps() else torch.device("cpu")
+    return torch.device(f"cuda:{_resolve_local_accelerator_index()}")
 
 
 def maybe_init_distributed_environment_and_model_parallel(
@@ -981,8 +1041,7 @@ def maybe_init_distributed_environment_and_model_parallel(
 
     # Only set CUDA device if we're on a CUDA platform
     if current_platform.is_cuda_alike():
-        device = torch.device(f"cuda:{local_rank}")
-        torch.cuda.set_device(device)
+        torch.cuda.set_device(get_local_torch_device())
 
 
 def model_parallel_is_initialized() -> bool:

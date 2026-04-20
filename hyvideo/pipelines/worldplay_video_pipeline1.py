@@ -15,10 +15,13 @@
 # See the License for the specific language governing permissions and limitations under the License.
 
 
+
+import gc
 import inspect
 import os
 import random
 import re
+from contextlib import nullcontext
 from dataclasses import dataclass
 from typing import Any, Dict, List, Optional, Union
 
@@ -997,6 +1000,832 @@ class HunyuanVideo_1_5_Pipeline(DiffusionPipeline):
             self._kv_cache_neg.append(
                 {"k_vision": None, "v_vision": None, "k_txt": None, "v_txt": None}
             )
+
+    def _cleanup_runtime_state(self, modules_to_cpu=None):
+        self._kv_cache = []
+        self._kv_cache_neg = []
+
+        if modules_to_cpu is None:
+            modules_to_cpu = []
+        for module in modules_to_cpu:
+            if module is None:
+                continue
+            try:
+                module.to("cpu")
+            except Exception:
+                pass
+
+        gc.collect()
+        if torch.cuda.is_available():
+            try:
+                torch.cuda.synchronize()
+            except Exception:
+                pass
+            torch.cuda.empty_cache()
+            if hasattr(torch.cuda, "ipc_collect"):
+                try:
+                    torch.cuda.ipc_collect()
+                except Exception:
+                    pass
+
+    @torch.no_grad()
+    def build_continuous_generation_cache(
+        self,
+        prompt: Union[str, List[str]],
+        aspect_ratio: str,
+        video_length: int,
+        prompt_rewrite: bool = True,
+        num_inference_steps: int = 50,
+        guidance_scale: Optional[float] = None,
+        negative_prompt: Optional[Union[str, List[str]]] = None,
+        generator: Optional[Union[torch.Generator, List[torch.Generator]]] = None,
+        seed: Optional[int] = None,
+        flow_shift: Optional[float] = None,
+        embedded_guidance_scale: Optional[float] = None,
+        reference_image=None,
+        user_height: Optional[int] = None,
+        user_width: Optional[int] = None,
+        chunk_latent_frames: int = 4,
+        **kwargs,
+    ):
+        num_videos_per_prompt = 1
+        target_resolution = self.ideal_resolution
+
+        if guidance_scale is None:
+            guidance_scale = self.config.guidance_scale
+        if embedded_guidance_scale is None:
+            embedded_guidance_scale = self.config.embedded_guidance_scale
+        if flow_shift is None:
+            flow_shift = self.config.flow_shift
+
+        if embedded_guidance_scale is not None:
+            assert not self.do_classifier_free_guidance
+            assert self.transformer.config.guidance_embed
+        else:
+            assert not self.transformer.config.guidance_embed
+
+        user_reference_image = reference_image
+        user_prompt = prompt
+
+        if reference_image is not None:
+            task_type = "i2v"
+            if isinstance(reference_image, str):
+                reference_image = Image.open(reference_image).convert("RGB")
+            elif not isinstance(reference_image, Image.Image):
+                raise ValueError(
+                    "reference_image must be a PIL Image or path to image file"
+                )
+            semantic_images_np = np.array(reference_image)
+        else:
+            task_type = "t2v"
+            semantic_images_np = None
+
+        if prompt_rewrite:
+            from hyvideo.utils.rewrite.rewrite_utils import run_prompt_rewrite
+
+            try:
+                prompt = run_prompt_rewrite(user_prompt, reference_image, task_type)
+            except Exception as e:
+                loguru.logger.warning(f"Failed to rewrite prompt: {e}")
+                prompt = user_prompt
+
+        if self.ideal_task is not None and self.ideal_task != task_type:
+            raise ValueError(
+                f"The loaded pipeline is trained for '{self.ideal_task}' task, "
+                f"but received input for '{task_type}' task. "
+                "Please load a pipeline trained for the correct task, "
+                "or check and update your arguments accordingly."
+            )
+
+        if flow_shift is None:
+            self.scheduler = self._create_scheduler(self.config.flow_shift)
+        else:
+            self.scheduler = self._create_scheduler(flow_shift)
+
+        if generator is None and seed is not None:
+            generator = torch.Generator(device=self.execution_device).manual_seed(seed)
+
+        if reference_image is not None:
+            if (
+                self.ideal_resolution is not None
+                and target_resolution != self.ideal_resolution
+            ):
+                raise ValueError(
+                    f"The loaded pipeline is trained for {self.ideal_resolution} resolution, "
+                    f"but received input for {target_resolution} resolution. "
+                )
+            height, width = self.get_closest_resolution_given_reference_image(
+                reference_image, target_resolution
+            )
+        else:
+            if self.ideal_resolution is not None:
+                if ":" not in aspect_ratio:
+                    raise ValueError("aspect_ratio must be separated by a colon")
+                width, height = aspect_ratio.split(":")
+                if (
+                    not width.isdigit()
+                    or not height.isdigit()
+                    or int(width) <= 0
+                    or int(height) <= 0
+                ):
+                    raise ValueError(
+                        "w and h must be positive and separated by a colon in aspect_ratio"
+                    )
+                width = int(width)
+                height = int(height)
+                height, width = self.get_closest_resolution_given_original_size(
+                    (width, height), self.ideal_resolution
+                )
+
+        height = user_height if user_height is not None else height
+        width = user_width if user_width is not None else width
+
+        latent_target_length, latent_height, latent_width = self.get_latent_size(
+            video_length, height, width
+        )
+        n_tokens = latent_target_length * latent_height * latent_width
+        multitask_mask = self.get_task_mask(task_type, latent_target_length)
+
+        self._guidance_scale = guidance_scale
+        self._guidance_rescale = kwargs.get("guidance_rescale", 0.0)
+        self._clip_skip = kwargs.get("clip_skip", None)
+
+        if prompt is not None and isinstance(prompt, str):
+            batch_size = 1
+        elif prompt is not None and isinstance(prompt, list):
+            batch_size = len(prompt)
+        else:
+            batch_size = 1
+        device = self.execution_device
+
+        with auto_offload_model(
+            self.text_encoder, self.execution_device, enabled=self.enable_offloading
+        ):
+            (
+                prompt_embeds,
+                negative_prompt_embeds,
+                prompt_mask,
+                negative_prompt_mask,
+            ) = self.encode_prompt(
+                prompt,
+                device,
+                num_videos_per_prompt,
+                self.do_classifier_free_guidance,
+                negative_prompt,
+                clip_skip=self.clip_skip,
+                data_type="video",
+            )
+
+        extra_kwargs = {}
+        if self.config.glyph_byT5_v2:
+            with auto_offload_model(
+                self.byt5_model, self.execution_device, enabled=self.enable_offloading
+            ):
+                extra_kwargs = self._prepare_byt5_embeddings(prompt, device)
+
+        if self.do_classifier_free_guidance:
+            prompt_embeds = torch.cat([negative_prompt_embeds, prompt_embeds])
+            if prompt_mask is not None:
+                prompt_mask = torch.cat([negative_prompt_mask, prompt_mask])
+
+        extra_set_timesteps_kwargs = self.prepare_extra_func_kwargs(
+            self.scheduler.set_timesteps, {"n_tokens": n_tokens}
+        )
+        timesteps, num_inference_steps = retrieve_timesteps(
+            self.scheduler,
+            num_inference_steps,
+            device,
+            **extra_set_timesteps_kwargs,
+        )
+
+        num_channels_latents = self.transformer.config.in_channels
+        latents = self.prepare_latents(
+            batch_size * num_videos_per_prompt,
+            num_channels_latents,
+            latent_height,
+            latent_width,
+            latent_target_length,
+            self.target_dtype,
+            device,
+            generator,
+        )
+
+        with auto_offload_model(
+            self.vae, self.execution_device, enabled=self.enable_offloading
+        ):
+            image_cond = self.get_image_condition_latents(
+                task_type, reference_image, height, width
+            )
+        cond_latents = self._prepare_cond_latents(
+            task_type, image_cond, latents, multitask_mask
+        )
+
+        with auto_offload_model(
+            self.vision_encoder, self.execution_device, enabled=self.enable_offloading
+        ):
+            vision_states = self._prepare_vision_states(
+                semantic_images_np, target_resolution, latents, device
+            )
+
+        num_warmup_steps = len(timesteps) - num_inference_steps * self.scheduler.order
+        points_local = generate_points_in_sphere(50000, 8.0).cpu()
+
+        cache = {
+            "prompt": prompt,
+            "user_prompt": user_prompt,
+            "reference_image_path": user_reference_image,
+            "task_type": task_type,
+            "aspect_ratio": aspect_ratio,
+            "video_length": video_length,
+            "height": height,
+            "width": width,
+            "latent_target_length": latent_target_length,
+            "latent_height": latent_height,
+            "latent_width": latent_width,
+            "chunk_latent_frames": chunk_latent_frames,
+            "chunk_num": latents.shape[2] // chunk_latent_frames,
+            "num_inference_steps": num_inference_steps,
+            "num_warmup_steps": num_warmup_steps,
+            "guidance_scale": guidance_scale,
+            "guidance_rescale": self._guidance_rescale,
+            "clip_skip": self._clip_skip,
+            "flow_shift": flow_shift,
+            "prompt_embeds": prompt_embeds.cpu(),
+            "prompt_mask": prompt_mask.cpu() if prompt_mask is not None else None,
+            "byt5_text_states": extra_kwargs.get("byt5_text_states", None).cpu()
+            if extra_kwargs.get("byt5_text_states", None) is not None
+            else None,
+            "byt5_text_mask": extra_kwargs.get("byt5_text_mask", None).cpu()
+            if extra_kwargs.get("byt5_text_mask", None) is not None
+            else None,
+            "timesteps": timesteps.cpu(),
+            "latents": latents.cpu(),
+            "cond_latents": cond_latents.cpu(),
+            "vision_states": vision_states.cpu() if vision_states is not None else None,
+            "points_local": points_local,
+        }
+        return cache
+
+    def get_ar_chunk_context_indices(
+        self,
+        viewmats: torch.Tensor,
+        chunk_idx: int,
+        chunk_latent_frames: int = 4,
+        device=None,
+        memory_frames: int = 20,
+        temporal_context_size: int = 12,
+    ):
+        if chunk_idx <= 0:
+            return []
+
+        if device is None:
+            device = self.execution_device
+        if memory_frames <= 0:
+            raise ValueError("memory_frames must be positive")
+        if temporal_context_size < 0:
+            raise ValueError("temporal_context_size must be non-negative")
+
+        current_frame_idx = chunk_idx * chunk_latent_frames
+        points_local = getattr(self, "points_local", None)
+        if points_local is None:
+            points_local = generate_points_in_sphere(50000, 8.0).to(device)
+            self.points_local = points_local
+        elif points_local.device != device:
+            points_local = points_local.to(device)
+            self.points_local = points_local
+
+        selected_frame_indices = []
+        for chunk_start_idx in range(
+            current_frame_idx, current_frame_idx + chunk_latent_frames, 4
+        ):
+            selected_history_frame_id = select_aligned_memory_frames(
+                viewmats[0].cpu().detach().numpy(),
+                chunk_start_idx,
+                memory_frames=memory_frames,
+                temporal_context_size=temporal_context_size,
+                pred_latent_size=4,
+                points_local=points_local,
+                device=device,
+            )
+            selected_frame_indices += selected_history_frame_id
+
+        selected_frame_indices = sorted(list(set(selected_frame_indices)))
+        to_remove = list(
+            range(current_frame_idx, current_frame_idx + chunk_latent_frames)
+        )
+        return [x for x in selected_frame_indices if x not in to_remove]
+
+    def _prime_text_kv_cache(
+        self,
+        prompt_embeds,
+        prompt_mask,
+        vision_states,
+        extra_kwargs,
+        task_type,
+        device,
+        latent_dtype,
+    ):
+        self.init_kv_cache()
+        positive_idx = 1 if self.do_classifier_free_guidance else 0
+
+        prompt_pos = None
+        prompt_mask_pos = None
+        vision_pos = None
+        extra_kwargs_pos = None
+        t_expand_txt = None
+        prompt_neg = None
+        prompt_mask_neg = None
+        vision_neg = None
+        extra_kwargs_neg = None
+
+        try:
+            with (
+                torch.autocast(
+                    device_type="cuda",
+                    dtype=self.target_dtype,
+                    enabled=self.autocast_enabled,
+                ),
+                auto_offload_model(
+                    self.transformer,
+                    self.execution_device,
+                    enabled=self.enable_offloading,
+                ),
+            ):
+                prompt_pos = prompt_embeds[positive_idx, None, ...].to(device)
+                prompt_mask_pos = (
+                    prompt_mask[positive_idx, None, ...].to(device)
+                    if prompt_mask is not None
+                    else None
+                )
+                vision_pos = vision_states[positive_idx, None, ...].to(device)
+                extra_kwargs_pos = {
+                    "byt5_text_states": extra_kwargs["byt5_text_states"][
+                        positive_idx, None, ...
+                    ].to(device),
+                    "byt5_text_mask": extra_kwargs["byt5_text_mask"][
+                        positive_idx, None, ...
+                    ].to(device),
+                }
+                t_expand_txt = torch.tensor([0], device=device, dtype=latent_dtype)
+                self._kv_cache = self.transformer(
+                    bi_inference=False,
+                    ar_txt_inference=True,
+                    ar_vision_inference=False,
+                    timestep_txt=t_expand_txt,
+                    text_states=prompt_pos,
+                    encoder_attention_mask=prompt_mask_pos,
+                    vision_states=vision_pos,
+                    mask_type=task_type,
+                    extra_kwargs=extra_kwargs_pos,
+                    kv_cache=self._kv_cache,
+                    cache_txt=True,
+                )
+                if self.do_classifier_free_guidance:
+                    prompt_neg = prompt_embeds[0, None, ...].to(device)
+                    prompt_mask_neg = (
+                        prompt_mask[0, None, ...].to(device)
+                        if prompt_mask is not None
+                        else None
+                    )
+                    vision_neg = vision_states[0, None, ...].to(device)
+                    extra_kwargs_neg = {
+                        "byt5_text_states": extra_kwargs["byt5_text_states"][
+                            0, None, ...
+                        ].to(device),
+                        "byt5_text_mask": extra_kwargs["byt5_text_mask"][
+                            0, None, ...
+                        ].to(device),
+                    }
+                    self._kv_cache_neg = self.transformer(
+                        bi_inference=False,
+                        ar_txt_inference=True,
+                        ar_vision_inference=False,
+                        timestep_txt=t_expand_txt,
+                        text_states=prompt_neg,
+                        encoder_attention_mask=prompt_mask_neg,
+                        vision_states=vision_neg,
+                        mask_type=task_type,
+                        extra_kwargs=extra_kwargs_neg,
+                        kv_cache=self._kv_cache_neg,
+                        cache_txt=True,
+                    )
+            if get_rank() == 0 and torch.cuda.is_available():
+                alloc_mb = torch.cuda.memory_allocated() / (1024**2)
+                reserved_mb = torch.cuda.memory_reserved() / (1024**2)
+                loguru.logger.info(
+                    f"After text KV cache: gpu_alloc={alloc_mb:.2f} MB | "
+                    f"gpu_reserved={reserved_mb:.2f} MB"
+                )
+        finally:
+            del prompt_pos
+            del prompt_mask_pos
+            del vision_pos
+            del extra_kwargs_pos
+            del t_expand_txt
+            del prompt_neg
+            del prompt_mask_neg
+            del vision_neg
+            del extra_kwargs_neg
+            gc.collect()
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
+
+    def _prime_context_kv_cache(
+        self,
+        context_latents,
+        context_cond_latents,
+        context_viewmats,
+        context_Ks,
+        context_action,
+        timesteps,
+        task_type,
+        device,
+    ):
+        stabilization_level = 15
+        context_latents_gpu = None
+        context_cond_latents_gpu = None
+        context_latents_input = None
+        context_viewmats_gpu = None
+        context_Ks_gpu = None
+        context_action_gpu = None
+        context_timestep = None
+
+        try:
+            context_latents_gpu = context_latents.to(device)
+            context_cond_latents_gpu = context_cond_latents.to(device)
+            context_latents_input = torch.concat(
+                [context_latents_gpu, context_cond_latents_gpu], dim=1
+            )
+            context_viewmats_gpu = context_viewmats.to(device).to(self.target_dtype)
+            context_Ks_gpu = context_Ks.to(device).to(self.target_dtype)
+            context_action_gpu = context_action.to(device).to(self.target_dtype)
+            context_timestep = torch.full(
+                (context_latents_input.shape[2],),
+                stabilization_level - 1,
+                device=device,
+                dtype=timesteps.dtype,
+            )
+
+            with (
+                torch.autocast(
+                    device_type="cuda",
+                    dtype=self.target_dtype,
+                    enabled=self.autocast_enabled,
+                ),
+                auto_offload_model(
+                    self.transformer,
+                    self.execution_device,
+                    enabled=self.enable_offloading,
+                ),
+            ):
+                self._kv_cache = self.transformer(
+                    bi_inference=False,
+                    ar_txt_inference=False,
+                    ar_vision_inference=True,
+                    hidden_states=context_latents_input,
+                    timestep=context_timestep,
+                    timestep_r=None,
+                    mask_type=task_type,
+                    return_dict=False,
+                    viewmats=context_viewmats_gpu,
+                    Ks=context_Ks_gpu,
+                    action=context_action_gpu,
+                    kv_cache=self._kv_cache,
+                    cache_vision=True,
+                    rope_temporal_size=context_latents_input.shape[2],
+                    start_rope_start_idx=0,
+                )
+                if self.do_classifier_free_guidance:
+                    self._kv_cache_neg = self.transformer(
+                        bi_inference=False,
+                        ar_txt_inference=False,
+                        ar_vision_inference=True,
+                        hidden_states=context_latents_input,
+                        timestep=context_timestep,
+                        timestep_r=None,
+                        mask_type=task_type,
+                        return_dict=False,
+                        viewmats=context_viewmats_gpu,
+                        Ks=context_Ks_gpu,
+                        action=context_action_gpu,
+                        kv_cache=self._kv_cache_neg,
+                        cache_vision=True,
+                        rope_temporal_size=context_latents_input.shape[2],
+                        start_rope_start_idx=0,
+                    )
+            if get_rank() == 0 and torch.cuda.is_available():
+                alloc_mb = torch.cuda.memory_allocated() / (1024**2)
+                reserved_mb = torch.cuda.memory_reserved() / (1024**2)
+                loguru.logger.info(
+                    f"After context KV cache: gpu_alloc={alloc_mb:.2f} MB | "
+                    f"gpu_reserved={reserved_mb:.2f} MB"
+                )
+        finally:
+            del context_latents_gpu
+            del context_cond_latents_gpu
+            del context_latents_input
+            del context_viewmats_gpu
+            del context_Ks_gpu
+            del context_action_gpu
+            del context_timestep
+            gc.collect()
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
+
+    @torch.no_grad()
+    def run_continuous_ar_chunk(
+        self,
+        cache,
+        chunk_idx,
+        viewmats,
+        Ks,
+        action,
+        current_chunk_latents,
+        current_chunk_cond_latents,
+        selected_frame_indices=None,
+        context_latents=None,
+        context_cond_latents=None,
+        show_progress=True,
+    ):
+        device = self.execution_device
+        timesteps = None
+        prompt_embeds = None
+        prompt_mask = None
+        vision_states = None
+        extra_kwargs = None
+        viewmats_input = None
+        Ks_input = None
+        action_input = None
+        result = None
+        try:
+            try:
+                if not self.enable_offloading:
+                    self.transformer.to(device)
+            except Exception:
+                pass
+            self._guidance_scale = cache["guidance_scale"]
+            self._guidance_rescale = cache.get("guidance_rescale", 0.0)
+            self._clip_skip = cache.get("clip_skip", None)
+            self.chunk_latent_frames = cache["chunk_latent_frames"]
+            self.num_inference_steps = cache["num_inference_steps"]
+            self.num_warmup_steps = cache["num_warmup_steps"]
+            self.points_local = cache["points_local"]
+
+            task_type = cache["task_type"]
+            timesteps = cache["timesteps"].to(device)
+            prompt_embeds = cache["prompt_embeds"]
+            prompt_mask = (
+                cache["prompt_mask"] if cache["prompt_mask"] is not None else None
+            )
+            vision_states = (
+                cache["vision_states"] if cache["vision_states"] is not None else None
+            )
+            extra_kwargs = {
+                "byt5_text_states": cache["byt5_text_states"],
+                "byt5_text_mask": cache["byt5_text_mask"],
+            }
+
+            current_chunk_latents = current_chunk_latents.to(device)
+            current_chunk_cond_latents = current_chunk_cond_latents.to(device)
+            self.scheduler.set_timesteps(self.num_inference_steps, device=device)
+
+            self._prime_text_kv_cache(
+                prompt_embeds=prompt_embeds,
+                prompt_mask=prompt_mask,
+                vision_states=vision_states,
+                extra_kwargs=extra_kwargs,
+                task_type=task_type,
+                device=device,
+                latent_dtype=current_chunk_latents.dtype,
+            )
+
+            selected_frame_indices = selected_frame_indices or []
+            if selected_frame_indices:
+                self._prime_context_kv_cache(
+                    context_latents=context_latents,
+                    context_cond_latents=context_cond_latents,
+                    context_viewmats=viewmats[:, selected_frame_indices],
+                    context_Ks=Ks[:, selected_frame_indices],
+                    context_action=action[:, selected_frame_indices],
+                    timesteps=timesteps,
+                    task_type=task_type,
+                    device=device,
+                )
+                context_latents = None
+                context_cond_latents = None
+                gc.collect()
+                if torch.cuda.is_available():
+                    torch.cuda.empty_cache()
+
+            start_idx = chunk_idx * self.chunk_latent_frames
+            end_idx = start_idx + self.chunk_latent_frames
+            viewmats_input = viewmats[:, start_idx:end_idx].to(device)
+            Ks_input = Ks[:, start_idx:end_idx].to(device)
+            action_input = action[:, start_idx:end_idx].to(device)
+            context_count = len(selected_frame_indices)
+
+            progress_context = (
+                self.progress_bar(total=self.num_inference_steps)
+                if show_progress
+                else nullcontext()
+            )
+
+            with (
+                progress_context as progress_bar,
+                auto_offload_model(
+                    self.transformer, self.execution_device, enabled=self.enable_offloading
+                ),
+            ):
+                for i, t in enumerate(timesteps):
+                    timestep_input = None
+                    latents_concat = None
+                    noise_pred = None
+                    noise_pred_uncond = None
+                    timestep_input = torch.full(
+                        (self.chunk_latent_frames,),
+                        t,
+                        device=device,
+                        dtype=timesteps.dtype,
+                    )
+                    latents_concat = torch.concat(
+                        [current_chunk_latents, current_chunk_cond_latents], dim=1
+                    )
+                    latents_concat = self.scheduler.scale_model_input(latents_concat, t)
+
+                    with torch.autocast(
+                        device_type="cuda",
+                        dtype=self.target_dtype,
+                        enabled=self.autocast_enabled,
+                    ):
+                        noise_pred = self.transformer(
+                            bi_inference=False,
+                            ar_txt_inference=False,
+                            ar_vision_inference=True,
+                            hidden_states=latents_concat,
+                            timestep=timestep_input,
+                            timestep_r=None,
+                            mask_type=task_type,
+                            return_dict=False,
+                            viewmats=viewmats_input.to(self.target_dtype),
+                            Ks=Ks_input.to(self.target_dtype),
+                            action=action_input.to(self.target_dtype),
+                            kv_cache=self._kv_cache,
+                            cache_vision=False,
+                            rope_temporal_size=latents_concat.shape[2] + context_count,
+                            start_rope_start_idx=context_count,
+                        )[0]
+                        if self.do_classifier_free_guidance:
+                            noise_pred_uncond = self.transformer(
+                                bi_inference=False,
+                                ar_txt_inference=False,
+                                ar_vision_inference=True,
+                                hidden_states=latents_concat,
+                                timestep=timestep_input,
+                                timestep_r=None,
+                                mask_type=task_type,
+                                return_dict=False,
+                                viewmats=viewmats_input.to(self.target_dtype),
+                                Ks=Ks_input.to(self.target_dtype),
+                                action=action_input.to(self.target_dtype),
+                                kv_cache=self._kv_cache_neg,
+                                cache_vision=False,
+                                rope_temporal_size=latents_concat.shape[2] + context_count,
+                                start_rope_start_idx=context_count,
+                            )[0]
+
+                    if self.do_classifier_free_guidance:
+                        noise_pred = noise_pred_uncond + self.guidance_scale * (
+                            noise_pred - noise_pred_uncond
+                        )
+
+                    current_chunk_latents = self.scheduler.step(
+                        noise_pred, t, current_chunk_latents, return_dict=False
+                    )[0][:, :, -self.chunk_latent_frames :]
+
+                    del timestep_input
+                    del latents_concat
+                    del noise_pred
+                    del noise_pred_uncond
+
+                    if i == len(timesteps) - 1 or (
+                        (i + 1) > self.num_warmup_steps
+                        and (i + 1) % self.scheduler.order == 0
+                    ):
+                        if progress_bar is not None:
+                            progress_bar.update()
+
+            if get_rank() == 0 and torch.cuda.is_available():
+                alloc_mb = torch.cuda.memory_allocated() / (1024**2)
+                reserved_mb = torch.cuda.memory_reserved() / (1024**2)
+                loguru.logger.info(
+                    f"After denoise chunk {chunk_idx}: gpu_alloc={alloc_mb:.2f} MB | "
+                    f"gpu_reserved={reserved_mb:.2f} MB"
+                )
+            result = current_chunk_latents.detach().cpu()
+        finally:
+            del timesteps
+            del prompt_embeds
+            del prompt_mask
+            del vision_states
+            del extra_kwargs
+            del viewmats_input
+            del Ks_input
+            del action_input
+            del current_chunk_latents
+            del current_chunk_cond_latents
+            del context_latents
+            del context_cond_latents
+            self._cleanup_runtime_state([getattr(self, "transformer", None)])
+        return result
+
+    @torch.no_grad()
+    def decode_latent_window(self, latents, generator=None):
+        video_frames = None
+        result = None
+        try:
+            if len(latents.shape) == 4:
+                latents = latents.unsqueeze(2)
+            elif len(latents.shape) != 5:
+                raise ValueError(
+                    f"Only support latents with shape (b, c, h, w) or (b, c, f, h, w), but got {latents.shape}."
+                )
+
+            try:
+                if not self.enable_offloading:
+                    self.vae.to(self.execution_device)
+            except Exception:
+                pass
+            latents = latents.to(self.execution_device)
+            if hasattr(self.vae.config, "shift_factor") and self.vae.config.shift_factor:
+                latents = (
+                    latents / self.vae.config.scaling_factor + self.vae.config.shift_factor
+                )
+            else:
+                latents = latents / self.vae.config.scaling_factor
+
+            if get_infer_state() and get_infer_state().use_vae_parallel:
+                self.vae.enable_spatial_tiling()
+                self.vae.enable_tile_parallelism()
+
+            with (
+                torch.autocast(
+                    device_type="cuda",
+                    dtype=self.vae_dtype,
+                    enabled=self.vae_autocast_enabled,
+                ),
+                auto_offload_model(
+                    self.vae, self.execution_device, enabled=self.enable_offloading
+                ),
+            ):
+                video_frames = self.vae.decode(
+                    latents, return_dict=False, generator=generator
+                )[0]
+            result = (video_frames / 2 + 0.5).clamp(0, 1).cpu().float()
+            return result
+        finally:
+            del video_frames
+            del latents
+            self._cleanup_runtime_state([getattr(self, "vae", None)])
+
+    def prepare_for_decode_only(self):
+        self._cleanup_runtime_state(
+            [
+                getattr(self, "transformer", None),
+                getattr(self, "text_encoder", None),
+                getattr(self, "text_encoder_2", None),
+                getattr(self, "vision_encoder", None),
+                getattr(self, "byt5_model", None),
+            ]
+        )
+
+    def prepare_for_generation_only(self):
+        self._cleanup_runtime_state(
+            [
+                getattr(self, "vae", None),
+                getattr(self, "text_encoder", None),
+                getattr(self, "text_encoder_2", None),
+                getattr(self, "vision_encoder", None),
+                getattr(self, "byt5_model", None),
+            ]
+        )
+
+        if not self.enable_offloading:
+            try:
+                self.transformer.to(self.execution_device)
+            except Exception:
+                pass
+
+    def prepare_for_idle(self):
+        self._cleanup_runtime_state(
+            [
+                getattr(self, "transformer", None),
+                getattr(self, "vae", None),
+                getattr(self, "text_encoder", None),
+                getattr(self, "text_encoder_2", None),
+                getattr(self, "vision_encoder", None),
+                getattr(self, "byt5_model", None),
+            ]
+        )
 
     def ar_rollout(
         self,

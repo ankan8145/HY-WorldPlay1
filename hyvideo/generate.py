@@ -15,12 +15,14 @@
 # See the License for the specific language governing permissions and limitations under the License.
 
 import os
+import gc
 
 if "PYTORCH_CUDA_ALLOC_CONF" not in os.environ:
     os.environ["PYTORCH_CUDA_ALLOC_CONF"] = "expandable_segments:True"
 
 import loguru
 import torch
+import torch.distributed as dist
 import argparse
 import einops
 import imageio
@@ -295,6 +297,28 @@ def save_video(video, path):
 def rank0_log(message, level):
     if int(os.environ.get("RANK", "0")) == 0:
         loguru.logger.log(level, message)
+
+
+def cleanup_runtime():
+    """Best-effort cleanup for repeated inference runs."""
+    gc.collect()
+    if torch.cuda.is_available():
+        try:
+            torch.cuda.synchronize()
+        except Exception:
+            pass
+        torch.cuda.empty_cache()
+        if hasattr(torch.cuda, "ipc_collect"):
+            try:
+                torch.cuda.ipc_collect()
+            except Exception:
+                pass
+
+    if dist.is_available() and dist.is_initialized():
+        try:
+            dist.destroy_process_group()
+        except Exception:
+            pass
 
 
 def str_to_bool(value):
@@ -698,132 +722,147 @@ def add_keyboard_overlay_to_video(video_path, output_path, actions_timeline):
 
 
 def generate_video(args):
+    pipe = None
+    out = None
     assert (
         (args.video_length - 1) // 4 + 1
     ) % 4 == 0, "number of latents must be divisible by 4"
     initialize_infer_state(args)
 
-    task = "i2v" if args.image_path else "t2v"
+    try:
+        task = "i2v" if args.image_path else "t2v"
 
-    enable_sr = args.sr
+        enable_sr = args.sr
 
-    # Build transformer_version based on flags
-    transformer_version = f"{args.resolution}_{task}"
-    assert transformer_version == "480p_i2v"
+        # Build transformer_version based on flags
+        transformer_version = f"{args.resolution}_{task}"
+        assert transformer_version == "480p_i2v"
 
-    if args.dtype == "bf16":
-        transformer_dtype = torch.bfloat16
-    elif args.dtype == "fp32":
-        transformer_dtype = torch.float32
-    else:
-        raise ValueError(f"Unsupported dtype: {args.dtype}. Must be 'bf16' or 'fp32'")
+        if args.dtype == "bf16":
+            transformer_dtype = torch.bfloat16
+        elif args.dtype == "fp32":
+            transformer_dtype = torch.float32
+        else:
+            raise ValueError(
+                f"Unsupported dtype: {args.dtype}. Must be 'bf16' or 'fp32'"
+            )
 
-    pipe = HunyuanVideo_1_5_Pipeline.create_pipeline(
-        pretrained_model_name_or_path=args.model_path,
-        transformer_version=transformer_version,
-        enable_offloading=args.offloading,
-        enable_group_offloading=args.group_offloading,
-        create_sr_pipeline=enable_sr,
-        force_sparse_attn=False,
-        transformer_dtype=transformer_dtype,
-        action_ckpt=args.action_ckpt,
-    )
-
-    extra_kwargs = {}
-    if task == "i2v":
-        extra_kwargs["reference_image"] = args.image_path
-
-    enable_rewrite = args.rewrite
-    if not args.rewrite:
-        rank0_log(
-            "Warning: Prompt rewriting is disabled. This may affect the quality of generated videos.",
-            "WARNING",
+        pipe = HunyuanVideo_1_5_Pipeline.create_pipeline(
+            pretrained_model_name_or_path=args.model_path,
+            transformer_version=transformer_version,
+            enable_offloading=args.offloading,
+            enable_group_offloading=args.group_offloading,
+            create_sr_pipeline=enable_sr,
+            force_sparse_attn=False,
+            transformer_dtype=transformer_dtype,
+            action_ckpt=args.action_ckpt,
         )
 
-    viewmats, Ks, action = pose_to_input(args.pose, (args.video_length - 1) // 4 + 1)
+        extra_kwargs = {}
+        if task == "i2v":
+            extra_kwargs["reference_image"] = args.image_path
 
-    if task == "i2v":
-        extra_kwargs["reference_image"] = args.image_path
+        enable_rewrite = args.rewrite
+        if not args.rewrite:
+            rank0_log(
+                "Warning: Prompt rewriting is disabled. This may affect the quality of generated videos.",
+                "WARNING",
+            )
 
-    out = pipe(
-        enable_sr=enable_sr,
-        prompt=args.prompt,
-        aspect_ratio=args.aspect_ratio,
-        num_inference_steps=args.num_inference_steps,
-        sr_num_inference_steps=None,
-        video_length=args.video_length,
-        negative_prompt=args.negative_prompt,
-        seed=args.seed,
-        output_type="pt",
-        prompt_rewrite=enable_rewrite,
-        return_pre_sr_video=args.save_pre_sr_video,
-        viewmats=viewmats.unsqueeze(0),
-        Ks=Ks.unsqueeze(0),
-        action=action.unsqueeze(0),
-        few_step=args.few_step,
-        chunk_latent_frames=4 if args.model_type == "ar" else 16,
-        model_type=args.model_type,
-        user_height=args.height,
-        user_width=args.width,
-        transformer_resident_ar_rollout=args.transformer_resident_ar_rollout,
-        **extra_kwargs,
-    )
+        viewmats, Ks, action = pose_to_input(
+            args.pose, (args.video_length - 1) // 4 + 1
+        )
 
-    # save video
-    if int(os.environ.get("RANK", "0")) == 0:
-        output_path = args.output_path
-        os.makedirs(output_path, exist_ok=True)
+        if task == "i2v":
+            extra_kwargs["reference_image"] = args.image_path
 
-        save_video_path = os.path.join(output_path, "gen.mp4")
-        save_video_sr_path = os.path.join(output_path, "gen_sr.mp4")
+        out = pipe(
+            enable_sr=enable_sr,
+            prompt=args.prompt,
+            aspect_ratio=args.aspect_ratio,
+            num_inference_steps=args.num_inference_steps,
+            sr_num_inference_steps=None,
+            video_length=args.video_length,
+            negative_prompt=args.negative_prompt,
+            seed=args.seed,
+            output_type="pt",
+            prompt_rewrite=enable_rewrite,
+            return_pre_sr_video=args.save_pre_sr_video,
+            viewmats=viewmats.unsqueeze(0),
+            Ks=Ks.unsqueeze(0),
+            action=action.unsqueeze(0),
+            few_step=args.few_step,
+            chunk_latent_frames=4 if args.model_type == "ar" else 16,
+            model_type=args.model_type,
+            user_height=args.height,
+            user_width=args.width,
+            transformer_resident_ar_rollout=args.transformer_resident_ar_rollout,
+            **extra_kwargs,
+        )
 
-        # Determine which video to process for UI overlay
-        video_to_process = None
-        final_video_path = None
+        # save video
+        if int(os.environ.get("RANK", "0")) == 0:
+            output_path = args.output_path
+            os.makedirs(output_path, exist_ok=True)
 
-        if enable_sr and hasattr(out, "sr_videos"):
-            save_video(out.sr_videos, save_video_sr_path)
-            print(f"Saved SR video to: {save_video_sr_path}")
-            video_to_process = save_video_sr_path
-            final_video_path = save_video_sr_path
+            save_video_path = os.path.join(output_path, "gen.mp4")
+            save_video_sr_path = os.path.join(output_path, "gen_sr.mp4")
 
-            if args.save_pre_sr_video:
+            # Determine which video to process for UI overlay
+            video_to_process = None
+            final_video_path = None
+
+            if enable_sr and hasattr(out, "sr_videos"):
+                save_video(out.sr_videos, save_video_sr_path)
+                print(f"Saved SR video to: {save_video_sr_path}")
+                video_to_process = save_video_sr_path
+                final_video_path = save_video_sr_path
+
+                if args.save_pre_sr_video:
+                    save_video(out.videos, save_video_path)
+                    print(f"Saved original video (before SR) to: {save_video_path}")
+            else:
                 save_video(out.videos, save_video_path)
-                print(f"Saved original video (before SR) to: {save_video_path}")
-        else:
-            save_video(out.videos, save_video_path)
-            print(f"Saved video to: {save_video_path}")
-            video_to_process = save_video_path
-            final_video_path = save_video_path
+                print(f"Saved video to: {save_video_path}")
+                video_to_process = save_video_path
+                final_video_path = save_video_path
 
-        # Add keyboard overlay if --with-ui is enabled and pose is a string
-        if (
-            args.with_ui
-            and isinstance(args.pose, str)
-            and not args.pose.endswith(".json")
-        ):
-            print(f"Adding keyboard overlay to video...")
-            try:
-                actions_timeline = parse_pose_string_to_actions(args.pose)
+            # Add keyboard overlay if --with-ui is enabled and pose is a string
+            if (
+                args.with_ui
+                and isinstance(args.pose, str)
+                and not args.pose.endswith(".json")
+            ):
+                print(f"Adding keyboard overlay to video...")
+                try:
+                    actions_timeline = parse_pose_string_to_actions(args.pose)
 
-                # Create temporary output path for video with UI
-                video_with_ui_path = os.path.join(output_path, "gen_with_ui_temp.mp4")
+                    # Create temporary output path for video with UI
+                    video_with_ui_path = os.path.join(
+                        output_path, "gen_with_ui_temp.mp4"
+                    )
 
-                if add_keyboard_overlay_to_video(
-                    video_to_process, video_with_ui_path, actions_timeline
-                ):
-                    # Replace original video with UI version
-                    os.replace(video_with_ui_path, final_video_path)
-                    print(f"Successfully added keyboard overlay to: {final_video_path}")
-                else:
-                    print(f"Failed to add keyboard overlay, keeping original video")
-                    if os.path.exists(video_with_ui_path):
-                        os.remove(video_with_ui_path)
-            except Exception as e:
-                print(f"Error processing keyboard overlay: {e}")
-                import traceback
+                    if add_keyboard_overlay_to_video(
+                        video_to_process, video_with_ui_path, actions_timeline
+                    ):
+                        # Replace original video with UI version
+                        os.replace(video_with_ui_path, final_video_path)
+                        print(
+                            f"Successfully added keyboard overlay to: {final_video_path}"
+                        )
+                    else:
+                        print(f"Failed to add keyboard overlay, keeping original video")
+                        if os.path.exists(video_with_ui_path):
+                            os.remove(video_with_ui_path)
+                except Exception as e:
+                    print(f"Error processing keyboard overlay: {e}")
+                    import traceback
 
-                traceback.print_exc()
+                    traceback.print_exc()
+    finally:
+        del out
+        del pipe
+        cleanup_runtime()
 
 
 def main():
@@ -1063,3 +1102,4 @@ def main():
 
 if __name__ == "__main__":
     main()
+

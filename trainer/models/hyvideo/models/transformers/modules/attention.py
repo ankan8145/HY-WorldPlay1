@@ -210,8 +210,12 @@ def sequence_parallel_attention(q, k, v,
         latent_seq_length = 1560      # set for hunyuanvideo 1.5, which is for 480 * 832 resolution
         chunk_seq_length = 1560 * 4
         chunk_num = (vision_seq_length) // chunk_seq_length
-        causal_mask = torch.zeros((total_seq_length, total_seq_length), device=query.device)
-        causal_mask[:, :text_seq_length] = 1  # no attention for the rest
+        causal_mask = torch.zeros(
+            (total_seq_length, total_seq_length),
+            device=query.device,
+            dtype=torch.bool,
+        )
+        causal_mask[:, :text_seq_length] = True  # text tokens are globally visible
         for i in range(chunk_num):
             start_i = text_seq_length + i * chunk_seq_length
             end_i = min(start_i + chunk_seq_length, total_seq_length)
@@ -219,11 +223,10 @@ def sequence_parallel_attention(q, k, v,
                 start_j = text_seq_length + j * chunk_seq_length
                 end_j = min(start_j + chunk_seq_length, total_seq_length)
                 # full attention within chunk i for j == i, causal for j < i
-                causal_mask[start_i:end_i, start_j:end_j] = 1
+                causal_mask[start_i:end_i, start_j:end_j] = True
 
         causal_mask = causal_mask.unsqueeze(0).unsqueeze(1) # 1, 1, S, S
         causal_mask = causal_mask.expand(query.shape[0], 1, -1, -1)
-        causal_mask = causal_mask.to(torch.bool)  # Force bool dtype
 
         query = query.transpose(1, 2)  # B * H * L * D
         key = key.transpose(1, 2)      # B * H * L * D

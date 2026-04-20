@@ -1,5 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 import dataclasses
+import gc
 import math
 import os
 import time
@@ -27,7 +28,10 @@ import trainer.envs as envs
 from trainer.attention.backends.video_sparse_attn import (
     VideoSparseAttentionMetadataBuilder)
 from trainer.configs.sample import SamplingParam
-from trainer.dataset import build_ar_camera_hunyuan_w_mem_dataloader
+from trainer.dataset import (
+    build_ar_camera_hunyuan_w_mem_dataloader,
+    build_origami_step_dataloader,
+)
 from trainer.dataset.dataloader.schema import pyarrow_schema_t2v
 from trainer.dataset.validation_dataset import ValidationDataset
 from trainer.distributed import (cleanup_dist_env_and_memory,
@@ -162,7 +166,11 @@ class TrainingPipeline(LoRAPipeline, ABC):
             last_epoch=self.init_steps - 1,
         )
 
-        self.train_dataset, self.train_dataloader = build_ar_camera_hunyuan_w_mem_dataloader(
+        dataloader_builder = build_ar_camera_hunyuan_w_mem_dataloader
+        if training_args.dataset_type == "origami_steps":
+            dataloader_builder = build_origami_step_dataloader
+
+        self.train_dataset, self.train_dataloader = dataloader_builder(
             json_path=training_args.json_path,
             causal=training_args.causal,
             window_frames=training_args.window_frames,
@@ -575,11 +583,13 @@ class TrainingPipeline(LoRAPipeline, ABC):
         # Set random seeds for deterministic training
         self.noise_random_generator = torch.Generator(device="cpu").manual_seed(
             self.seed)
-        self.noise_gen_cuda = torch.Generator(device="cuda").manual_seed(
+        noise_device = get_local_torch_device()
+        self.noise_gen_cuda = torch.Generator(device=noise_device).manual_seed(
             self.seed)
         self.validation_random_generator = torch.Generator(
             device="cpu").manual_seed(self.seed)
-        logger.info("Initialized random seeds with seed: %s", self.seed)
+        logger.info("Initialized random seeds with seed: %s on device %s",
+                    self.seed, noise_device)
 
         self.noise_scheduler = FlowMatchEulerDiscreteScheduler()
 
@@ -648,20 +658,105 @@ class TrainingPipeline(LoRAPipeline, ABC):
                     step=step,
                 )
 
-            if step % self.training_args.checkpointing_steps == 0:
-                save_checkpoint(self.transformer, self.global_rank,
-                                self.training_args.output_dir, step,
-                                self.optimizer, self.train_dataloader,
-                                self.lr_scheduler, self.noise_random_generator)
+            if self.global_rank == 0 and step % self.training_args.log_steps == 0:
+                gpu_memory_usage = 0.0
+                if torch.cuda.is_available():
+                    gpu_memory_usage = torch.cuda.memory_allocated() / 1024**2
+                logger.info(
+                    "Step %s/%s | loss=%.4f | step_time=%.2fs | avg_step_time=%.2fs | grad_norm=%.4f | lr=%.6g | gpu_mem=%.2f MB",
+                    step,
+                    self.training_args.max_train_steps,
+                    loss,
+                    step_time,
+                    avg_step_time,
+                    grad_norm,
+                    self.lr_scheduler.get_last_lr()[0],
+                    gpu_memory_usage,
+                )
+
+            if step % 10 == 0:
+                gc.collect()
+                if torch.cuda.is_available():
+                    torch.cuda.empty_cache()
+                    if hasattr(torch.cuda, "ipc_collect"):
+                        torch.cuda.ipc_collect()
+
+            saved_checkpoint = False
+            if (self.training_args.training_state_checkpointing_steps > 0
+                    and step %
+                    self.training_args.training_state_checkpointing_steps == 0):
+                save_checkpoint(
+                    self.transformer,
+                    self.global_rank,
+                    self.training_args.output_dir,
+                    step,
+                    self.optimizer,
+                    self.train_dataloader,
+                    self.lr_scheduler,
+                    self.noise_random_generator,
+                    save_distributed_checkpoint=True,
+                    save_consolidated_checkpoint=False,
+                    checkpoints_total_limit=self.training_args.
+                    checkpoints_total_limit,
+                )
+                saved_checkpoint = True
+
+            if (self.training_args.weight_only_checkpointing_steps > 0 and
+                    step % self.training_args.weight_only_checkpointing_steps
+                    == 0):
+                save_checkpoint(
+                    self.transformer,
+                    self.global_rank,
+                    self.training_args.output_dir,
+                    step,
+                    self.optimizer,
+                    self.train_dataloader,
+                    self.lr_scheduler,
+                    self.noise_random_generator,
+                    save_distributed_checkpoint=False,
+                    save_consolidated_checkpoint=True,
+                    checkpoints_total_limit=self.training_args.
+                    checkpoints_total_limit,
+                )
+                saved_checkpoint = True
+
+            if (not saved_checkpoint and
+                    self.training_args.checkpointing_steps > 0 and
+                    step % self.training_args.checkpointing_steps == 0):
+                save_checkpoint(
+                    self.transformer,
+                    self.global_rank,
+                    self.training_args.output_dir,
+                    step,
+                    self.optimizer,
+                    self.train_dataloader,
+                    self.lr_scheduler,
+                    self.noise_random_generator,
+                    save_distributed_checkpoint=False,
+                    save_consolidated_checkpoint=True,
+                    checkpoints_total_limit=self.training_args.
+                    checkpoints_total_limit,
+                )
+                saved_checkpoint = True
+
+            if saved_checkpoint:
                 self.transformer.train()
                 self.sp_group.barrier()
 
         wandb.finish()
-        save_checkpoint(self.transformer, self.global_rank,
-                        self.training_args.output_dir,
-                        self.training_args.max_train_steps, self.optimizer,
-                        self.train_dataloader, self.lr_scheduler,
-                        self.noise_random_generator)
+        save_checkpoint(
+            self.transformer,
+            self.global_rank,
+            self.training_args.output_dir,
+            self.training_args.max_train_steps,
+            self.optimizer,
+            self.train_dataloader,
+            self.lr_scheduler,
+            self.noise_random_generator,
+            save_distributed_checkpoint=False,
+            save_consolidated_checkpoint=True,
+            checkpoints_total_limit=self.training_args.checkpoints_total_limit,
+        )
 
         if get_sp_group():
             cleanup_dist_env_and_memory()
